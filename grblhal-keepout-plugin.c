@@ -5,6 +5,15 @@
 #include "grbl/nvs_buffer.h"
 #include "grbl/gcode.h"
 
+
+// todo:
+// - Obtain correct $$ options from Terje
+// - Address alarms to prevent lockout of jog (and drops into Critical Event needing reset - to fix)
+// - Improve reporting on enable/disable
+// - better way to handle enabled/disabled status for UI
+//
+
+
 // Keepout config stored in NVS
 typedef struct {
     float x_offset;
