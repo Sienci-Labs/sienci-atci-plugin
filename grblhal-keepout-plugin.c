@@ -1,15 +1,16 @@
-// todo:
-// - Obtain correct $$ options from Terje
-// - Address alarms to prevent lockout of jog (and drops into Critical Event needing reset - to fix)
-// - Improve reporting on enable/disable
-// - better way to handle enabled/disabled status for UI
-
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
+
 #include "grbl/hal.h"
 #include "grbl/nvs_buffer.h"
 #include "grbl/gcode.h"
+#include "grbl/system.h"
+#include "grbl/motion_control.h"
+
+extern system_t sys;
+
+// #define KEEP_DEBUG 1
 
 typedef struct {
     float x_offset;
@@ -27,13 +28,148 @@ static on_report_options_ptr on_report_options = NULL;
 
 static travel_limits_ptr prev_check_travel_limits = NULL;
 static apply_travel_limits_ptr prev_apply_travel_limits = NULL;
+static arc_limits_ptr prev_check_arc_limits = NULL;
 
 #define SETTING_X_OFFSET   Setting_UserDefined_0
 #define SETTING_Y_OFFSET   Setting_UserDefined_1
 #define SETTING_X_WIDTH    Setting_UserDefined_2
 #define SETTING_Y_HEIGHT   Setting_UserDefined_3
 
-// Settings
+static inline float keepout_xmin(void) { return -config.x_offset - config.x_width; }
+static inline float keepout_xmax(void) { return -config.x_offset; }
+static inline float keepout_ymin(void) { return -config.y_offset - config.y_height; }
+static inline float keepout_ymax(void) { return -config.y_offset; }
+
+static bool line_intersects_keepout(float x0, float y0, float x1, float y1)
+{
+    float dx = x1 - x0;
+    float dy = y1 - y0;
+    float t0 = 0.0f, t1 = 1.0f;
+
+    float p[4] = { -dx, dx, -dy, dy };
+    float q[4] = {
+        x0 - keepout_xmin(), keepout_xmax() - x0,
+        y0 - keepout_ymin(), keepout_ymax() - y0
+    };
+
+    for (int i = 0; i < 4; i++) {
+        if (p[i] == 0) {
+            if (q[i] < 0) return false;
+        } else {
+            float t = q[i] / p[i];
+            if (p[i] < 0) {
+                if (t > t1) return false;
+                if (t > t0) t0 = t;
+            } else {
+                if (t < t0) return false;
+                if (t < t1) t1 = t;
+            }
+        }
+    }
+
+    return true;
+}
+
+static bool travel_limits_check(float *target, axes_signals_t axes, bool is_cartesian)
+{
+    if (!config.enabled)
+        return prev_check_travel_limits ? prev_check_travel_limits(target, axes, is_cartesian) : true;
+
+    float xt = target[X_AXIS];
+    float yt = target[Y_AXIS];
+
+    float pos[N_AXIS];
+    system_convert_array_steps_to_mpos(pos, sys.position);
+    float x0 = pos[X_AXIS];
+    float y0 = pos[Y_AXIS];
+
+    #ifdef KEEP_DEBUG
+        char dbg[120];
+        snprintf(dbg, sizeof(dbg), "[KEEPOUT_DBG] Move from (%.3f, %.3f) -> (%.3f, %.3f)", x0, y0, xt, yt);
+        report_message(dbg, Message_Debug);
+    #endif
+
+    if (xt >= keepout_xmin() && xt <= keepout_xmax() &&
+        yt >= keepout_ymin() && yt <= keepout_ymax()) {
+        report_message("Keepout: Target inside region", Message_Warning);
+        return false;
+    }
+
+    if (line_intersects_keepout(x0, y0, xt, yt)) {
+        report_message("Keepout: Move crosses keepout zone", Message_Warning);
+        return false;
+    }
+
+    return prev_check_travel_limits ? prev_check_travel_limits(target, axes, is_cartesian) : true;
+}
+
+
+static void keepout_apply_travel_limits(float *target, float *current_position)
+{
+    if (!config.enabled) {
+        if (prev_apply_travel_limits)
+            prev_apply_travel_limits(target, current_position);
+        return;
+    }
+
+    float xt = target[X_AXIS];
+    float yt = target[Y_AXIS];
+    float x0 = current_position[X_AXIS];
+    float y0 = current_position[Y_AXIS];
+
+    bool in_box = (xt >= keepout_xmin() && xt <= keepout_xmax() &&
+                   yt >= keepout_ymin() && yt <= keepout_ymax());
+    bool intersects = line_intersects_keepout(x0, y0, xt, yt);
+
+    if (in_box || intersects) {
+        report_message("Keepout: Jog move blocked", Message_Warning);
+    #ifdef KEEP_DEBUG
+        report_message("[KEEPOUT_DBG] Jog blocked due to keepout", Message_Debug);
+    #endif
+        memcpy(target, current_position, sizeof(float) * N_AXIS);
+        return;
+    }
+
+    if (prev_apply_travel_limits)
+        prev_apply_travel_limits(target, current_position);
+}
+
+
+static user_mcode_type_t mcode_check(user_mcode_t mcode)
+{
+    return (mcode == 810 || mcode == 811) ? UserMCode_Normal :
+           user_mcode.check ? user_mcode.check(mcode) : UserMCode_Unsupported;
+}
+
+static status_code_t mcode_validate(parser_block_t *gc_block)
+{
+    return Status_OK;
+}
+
+static void mcode_execute(uint_fast16_t state, parser_block_t *gc_block)
+{
+    if (state == STATE_CHECK_MODE)
+        return;
+
+    if (gc_block->user_mcode == 810) {
+        config.enabled = true;
+        report_message("Keepout ENABLED", Message_Info);
+        prev_check_arc_limits = grbl.check_arc_travel_limits;
+        grbl.check_arc_travel_limits = NULL;
+
+        char region[100];
+        snprintf(region, sizeof(region), "Keepout: X[%.2f..%.2f] Y[%.2f..%.2f]",
+            keepout_xmin(), keepout_xmax(), keepout_ymin(), keepout_ymax());
+        report_message(region, Message_Info);
+
+    } else if (gc_block->user_mcode == 811) {
+        config.enabled = false;
+        report_message("Keepout DISABLED", Message_Info);
+        if (prev_check_arc_limits)
+            grbl.check_arc_travel_limits = prev_check_arc_limits;
+    }
+}
+
 static status_code_t set_setting(setting_id_t id, float value)
 {
     switch(id) {
@@ -66,92 +202,6 @@ static const setting_detail_t plugin_settings[] = {
     { SETTING_Y_HEIGHT, Group_UserSettings, "Keepout Y Height", "mm", Format_Decimal, "#0.00", NULL, NULL, Setting_IsLegacyFn, set_setting, get_setting },
 };
 
-// Keepout Logic
-static bool travel_limits_check(float *target, axes_signals_t axes, bool is_cartesian)
-{
-    float x = target[X_AXIS];
-    float y = target[Y_AXIS];
-
-    if (config.enabled) {
-        float xmin = -config.x_offset - config.x_width;
-        float xmax = -config.x_offset;
-        float ymin = -config.y_offset - config.y_height;
-        float ymax = -config.y_offset;
-
-        if (x >= xmin && x <= xmax && y >= ymin && y <= ymax) {
-            report_message("Keepout zone: move blocked", Message_Warning);
-            //system_raise_alarm(Alarm_SoftLimit);
-            return false;
-        }
-    }
-
-    return prev_check_travel_limits ? prev_check_travel_limits(target, axes, is_cartesian) : true;
-}
-
-
-static void keepout_apply_travel_limits(float *target, float *current_position)
-{
-    float x = target[X_AXIS];
-    float y = target[Y_AXIS];
-
-    if (config.enabled) {
-        float xmin = -config.x_offset - config.x_width;
-        float xmax = -config.x_offset;
-        float ymin = -config.y_offset - config.y_height;
-        float ymax = -config.y_offset;
-
-        if (x >= xmin && x <= xmax && y >= ymin && y <= ymax) {
-            report_message("Keepout zone: Jog move blocked", Message_Warning);
-            // You CANNOT raise an alarm here or return error
-            // All you can do is prevent modifying target[] if needed
-            memcpy(target, current_position, sizeof(float) * N_AXIS); // block move
-            return;
-        }
-    }
-
-    if (prev_apply_travel_limits)
-        prev_apply_travel_limits(target, current_position);
-}
-
-// M-code Handler
-static user_mcode_type_t mcode_check(user_mcode_t mcode)
-{
-    if(mcode == 810 || mcode == 811)
-        return UserMCode_Normal;
-    return user_mcode.check ? user_mcode.check(mcode) : UserMCode_Unsupported;
-}
-
-static status_code_t mcode_validate(parser_block_t *gc_block)
-{
-    (void)gc_block;
-    return Status_OK;
-}
-
-static void mcode_execute(uint_fast16_t state, parser_block_t *gc_block)
-{
-    if(state == STATE_CHECK_MODE)
-        return;
-
-    if(gc_block->user_mcode == 810) {
-        config.enabled = true;
-        report_message("Keepout ENABLED", Message_Info);
-
-        char region[100];
-        float xmin = -config.x_offset - config.x_width;
-        float xmax = -config.x_offset;
-        float ymin = -config.y_offset - config.y_height;
-        float ymax = -config.y_offset;
-        snprintf(region, sizeof(region), "Keepout Region: X[%.2f..%.2f] Y[%.2f..%.2f]", xmin, xmax, ymin, ymax);
-        report_message(region, Message_Info);
-    }
-    else if(gc_block->user_mcode == 811) {
-        config.enabled = false;
-        report_message("Keepout DISABLED", Message_Info);
-    }
-}
-
-// --- Persistence ---
-
 static void keepout_restore(void)
 {
     config.x_offset = 50.0f;
@@ -169,17 +219,15 @@ static void keepout_load(void)
         keepout_restore();
 }
 
-// Reporting
 static void onReportOptions(bool newopt)
 {
     if(on_report_options)
         on_report_options(newopt);
 
     if(!newopt)
-        report_plugin("SIENCI Keepout Plugin", "0.3");
+        report_plugin("SIENCI Keepout Plugin", "0.5");
 }
 
-// Init
 void keepout_init(void)
 {
     static setting_details_t settings = {
@@ -189,28 +237,26 @@ void keepout_init(void)
         .restore = keepout_restore
     };
 
-    if((nvs_addr = nvs_alloc(sizeof(config)))) {
+    if ((nvs_addr = nvs_alloc(sizeof(config)))) {
         keepout_load();
 
-        // Hook travel limits
         prev_check_travel_limits = grbl.check_travel_limits;
         grbl.check_travel_limits = travel_limits_check;
 
         prev_apply_travel_limits = grbl.apply_travel_limits;
         grbl.apply_travel_limits = keepout_apply_travel_limits;
 
-        // Hook M-codes
+        prev_check_arc_limits = grbl.check_arc_travel_limits;
+
         memcpy(&user_mcode, &grbl.user_mcode, sizeof(user_mcode_ptrs_t));
         grbl.user_mcode.check = mcode_check;
         grbl.user_mcode.validate = mcode_validate;
         grbl.user_mcode.execute = mcode_execute;
 
-        // Hook report
         on_report_options = grbl.on_report_options;
         grbl.on_report_options = onReportOptions;
 
         settings_register(&settings);
-
         report_message("Keepout plugin initialized", Message_Info);
     }
 }
