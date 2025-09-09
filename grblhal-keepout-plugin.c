@@ -11,6 +11,8 @@
 #include "grbl/settings.h"
 #include "grbl/plugins.h"
 
+
+
 extern system_t sys;
 
 // #define KEEP_DEBUG 1
@@ -23,6 +25,7 @@ typedef struct {
     bool enabled;             // Current enabled/disabled state, controlled by M-code or pin
     bool plugin_enabled;      // Master on/off switch for the plugin from settings
     bool monitor_rack_presence; // Setting to enable/disable pin monitoring
+    bool monitor_tc_macro; // Setting to enable/disable toolchange macro monitoring
     bool manual_override;     // Flag to indicate M810 has been used
     bool last_pin_state;      // The last seen state of the input pin (true = LOW/present)
 } keepout_config_t;
@@ -43,13 +46,17 @@ static travel_limits_ptr prev_check_travel_limits = NULL;
 static apply_travel_limits_ptr prev_apply_travel_limits = NULL;
 static arc_limits_ptr prev_check_arc_limits = NULL;
 
+static on_tool_selected_ptr on_tool_selected;
+static on_tool_changed_ptr on_tool_changed;
+
 // Settings Order
-#define SETTING_PLUGIN_ENABLE        Setting_UserDefined_0
+#define SETTING_PLUGIN_ENABLE         Setting_UserDefined_0
 #define SETTING_MONITOR_RACK_PRESENCE Setting_UserDefined_1
-#define SETTING_X_MIN                Setting_UserDefined_2
-#define SETTING_Y_MIN                Setting_UserDefined_3
-#define SETTING_X_MAX                Setting_UserDefined_4
-#define SETTING_Y_MAX                Setting_UserDefined_5
+#define SETTING_MONITOR_TC_MACRO      Setting_UserDefined_2
+#define SETTING_X_MIN                 Setting_UserDefined_3
+#define SETTING_Y_MIN                 Setting_UserDefined_4
+#define SETTING_X_MAX                 Setting_UserDefined_5
+#define SETTING_Y_MAX                 Setting_UserDefined_6
 
 // Forward declarations for our separate getter/setter functions
 static status_code_t set_bool_setting(setting_id_t id, uint_fast16_t value);
@@ -206,6 +213,25 @@ static status_code_t mcode_validate(parser_block_t *gc_block)
     return state == Status_Unhandled && user_mcode.validate ? user_mcode.validate(gc_block) : state;
 }
 
+static void keepout_tool_selected (tool_data_t *tool)
+{
+
+  config.enabled = false;
+  report_keepout_status()
+  if(on_tool_selected)
+      on_tool_selected(tool);
+
+}
+
+static void keepout_tool_changed (tool_data_t *tool)
+{
+
+  if(on_tool_changed)
+      on_tool_changed(tool);
+
+      config.enabled = true;
+      report_keepout_status()
+}
 
 static void report_keepout_status(void)
 {
@@ -266,6 +292,7 @@ static status_code_t set_bool_setting(setting_id_t id, uint_fast16_t value) {
     switch(id) {
         case SETTING_PLUGIN_ENABLE:           config.plugin_enabled = val; break;
         case SETTING_MONITOR_RACK_PRESENCE:   config.monitor_rack_presence = val; break;
+        case SETTING_MONITOR_TC_MACRO:   config.monitor_tc_macro = val; break;
         default: return Status_Unhandled;
     }
     hal.nvs.memcpy_to_nvs(nvs_addr, (uint8_t *)&config, sizeof(config), true);
@@ -276,6 +303,7 @@ static uint_fast16_t get_bool_setting(setting_id_t id) {
     switch(id) {
         case SETTING_PLUGIN_ENABLE:           return config.plugin_enabled;
         case SETTING_MONITOR_RACK_PRESENCE:   return config.monitor_rack_presence;
+        case SETTING_MONITOR_TC_MACRO: return config.monitor_tc_macro;
         default: return 0;
     }
 }
@@ -304,12 +332,13 @@ static float get_float_setting(setting_id_t id) {
 
 
 static const setting_detail_t plugin_settings[] = {
-    { SETTING_PLUGIN_ENABLE,         Group_UserSettings, "Keepout Plugin Enabled", NULL, Format_Bool,    NULL,       NULL,     NULL,    Setting_IsLegacyFn, (void *)set_bool_setting, (void *)get_bool_setting },
-    { SETTING_MONITOR_RACK_PRESENCE, Group_UserSettings, "Monitor Rack Presence",  NULL, Format_Bool,    NULL,       NULL,     NULL,    Setting_IsLegacyFn, (void *)set_bool_setting, (void *)get_bool_setting },
-    { SETTING_X_MIN,                 Group_UserSettings, "Keepout X Min",          "mm", Format_Decimal, "-####0.00", "-10000", "10000", Setting_IsLegacyFn, set_float_setting, get_float_setting },
-    { SETTING_Y_MIN,                 Group_UserSettings, "Keepout Y Min",          "mm", Format_Decimal, "-####0.00", "-10000", "10000", Setting_IsLegacyFn, set_float_setting, get_float_setting },
-    { SETTING_X_MAX,                 Group_UserSettings, "Keepout X Max",          "mm", Format_Decimal, "-####0.00", "-10000", "10000", Setting_IsLegacyFn, set_float_setting, get_float_setting },
-    { SETTING_Y_MAX,                 Group_UserSettings, "Keepout Y Max",          "mm", Format_Decimal, "-####0.00", "-10000", "10000", Setting_IsLegacyFn, set_float_setting, get_float_setting },
+    { SETTING_PLUGIN_ENABLE,         Group_UserSettings, "Keepout Plugin Enabled",        NULL, Format_Bool,    NULL,       NULL,     NULL,    Setting_IsLegacyFn, (void *)set_bool_setting, (void *)get_bool_setting },
+    { SETTING_MONITOR_RACK_PRESENCE, Group_UserSettings, "Keepout Monitor Rack Presence", NULL, Format_Bool,    NULL,       NULL,     NULL,    Setting_IsLegacyFn, (void *)set_bool_setting, (void *)get_bool_setting },
+    { SETTING_MONITOR_TC_MACRO,      Group_UserSettings, "Keepout Monitor TC Macro",      NULL, Format_Bool,    NULL,       NULL,     NULL,    Setting_IsLegacyFn, (void *)set_bool_setting, (void *)get_bool_setting },
+    { SETTING_X_MIN,                 Group_UserSettings, "Keepout X Min",                 "mm",  Format_Decimal, "-####0.00", "-10000", "10000", Setting_IsLegacyFn, set_float_setting, get_float_setting },
+    { SETTING_Y_MIN,                 Group_UserSettings, "Keepout Y Min",                 "mm", Format_Decimal, "-####0.00", "-10000", "10000", Setting_IsLegacyFn, set_float_setting, get_float_setting },
+    { SETTING_X_MAX,                 Group_UserSettings, "Keepout X Max",                 "mm", Format_Decimal, "-####0.00", "-10000", "10000", Setting_IsLegacyFn, set_float_setting, get_float_setting },
+    { SETTING_Y_MAX,                 Group_UserSettings, "Keepout Y Max",                 "mm", Format_Decimal, "-####0.00", "-10000", "10000", Setting_IsLegacyFn, set_float_setting, get_float_setting },
 };
 
 static void keepout_restore(void)
@@ -375,6 +404,12 @@ void keepout_init(void)
 
         on_report_options = grbl.on_report_options;
         grbl.on_report_options = onReportOptions;
+
+        on_tool_selected = grbl.on_tool_selected;
+        grbl.on_tool_selected = keepout_tool_selected;
+
+        on_tool_changed = grbl.on_tool_changed;
+        grbl.on_tool_changed = keepout_tool_changed;
 
         settings_register(&settings);
         report_message("Keepout plugin initialized", Message_Info);
