@@ -72,6 +72,8 @@ static inline float keepout_xmax(void) { return config.x_min < config.x_max ? co
 static inline float keepout_ymin(void) { return config.y_min < config.y_max ? config.y_min : config.y_max; }
 static inline float keepout_ymax(void) { return config.y_min < config.y_max ? config.y_max : config.y_min; }
 
+#define KEEPOUT_SAFETY_MARGIN 1.0f
+
 static void set_keepout_state(bool new_state, keepout_source_t event_source)
 {
     if (config.enabled != new_state || config.source != event_source) {
@@ -118,12 +120,11 @@ static void poll_rack_sensor(void *data)
     tool_sensor_state     = !DIGITAL_IN(AUXINPUT1_PORT, AUXINPUT1_PIN);
     pressure_sensor_state = !DIGITAL_IN(AUXINPUT2_PORT, AUXINPUT2_PIN);
 
-    // Track if we are inside keepout zone (based on machine position)
-    float pos[N_AXIS];
-    system_convert_array_steps_to_mpos(pos, sys.position);
-    inside_keepout_zone =
-        (pos[X_AXIS] >= keepout_xmin() && pos[X_AXIS] <= keepout_xmax() &&
-         pos[Y_AXIS] >= keepout_ymin() && pos[Y_AXIS] <= keepout_ymax());
+    // Track if we are inside keepout zone (based on planner position)
+   float *pos = plan_get_position();
+   inside_keepout_zone =
+       (pos[X_AXIS] >= keepout_xmin() && pos[X_AXIS] <= keepout_xmax() &&
+        pos[Y_AXIS] >= keepout_ymin() && pos[Y_AXIS] <= keepout_ymax());
 
     task_add_delayed(poll_rack_sensor, NULL, 100); // 100ms polling
 }
@@ -169,10 +170,10 @@ static bool travel_limits_check(float *target, axes_signals_t axes, bool is_cart
 
     float xt = target[X_AXIS];
     float yt = target[Y_AXIS];
-    float pos[N_AXIS];
-    system_convert_array_steps_to_mpos(pos, sys.position);
+    float *pos = plan_get_position();
     float x0 = pos[X_AXIS];
     float y0 = pos[Y_AXIS];
+
 
     if (xt >= keepout_xmin() && xt <= keepout_xmax() && yt >= keepout_ymin() && yt <= keepout_ymax()) {
         if (inside_keepout_zone)
@@ -193,31 +194,100 @@ static bool travel_limits_check(float *target, axes_signals_t axes, bool is_cart
     return prev_check_travel_limits ? prev_check_travel_limits(target, axes, is_cartesian, envelope) : true;
 }
 
+static bool calculate_clipped_point(const float *start, const float *end, float *clipped_point)
+{
+    const float x0 = start[X_AXIS];
+    const float y0 = start[Y_AXIS];
+    const float x1 = end[X_AXIS];
+    const float y1 = end[Y_AXIS];
+
+    // Define the boundary we cannot cross (keepout zone + safety margin)
+    const float safe_boundary_xmin = keepout_xmin() - KEEPOUT_SAFETY_MARGIN;
+    const float safe_boundary_xmax = keepout_xmax() + KEEPOUT_SAFETY_MARGIN;
+    const float safe_boundary_ymin = keepout_ymin() - KEEPOUT_SAFETY_MARGIN;
+    const float safe_boundary_ymax = keepout_ymax() + KEEPOUT_SAFETY_MARGIN;
+
+    float t0 = 0.0f, t1 = 1.0f;
+    const float dx = x1 - x0;
+    const float dy = y1 - y0;
+
+    const float p[4] = { -dx, dx, -dy, dy };
+    const float q[4] = {
+        x0 - safe_boundary_xmin,
+        safe_boundary_xmax - x0,
+        y0 - safe_boundary_ymin,
+        safe_boundary_ymax - y0
+    };
+
+    for (int i = 0; i < 4; i++) {
+        if (p[i] == 0) {
+            if (q[i] < 0) return false; // Parallel and outside, no intersection
+        } else {
+            float t = q[i] / p[i];
+            if (p[i] < 0) { // Line is entering across this edge
+                if (t > t1) return false; // Line misses the box entirely
+                if (t > t0) t0 = t;       // Update the 'first' intersection time
+            } else { // Line is leaving across this edge
+                if (t < t0) return false; // Line misses the box entirely
+                if (t < t1) t1 = t;       // Update the 'last' intersection time
+            }
+        }
+    }
+
+    // If t0 > 0, an intersection was found that requires clipping.
+    if (t0 > 0.0f) {
+        memcpy(clipped_point, end, sizeof(float) * N_AXIS); // Preserve Z and other axes from original target
+        clipped_point[X_AXIS] = x0 + t0 * dx;
+        clipped_point[Y_AXIS] = y0 + t0 * dy;
+        return true;
+    }
+
+    return false; // No clipping was necessary
+}
+
 static void keepout_apply_travel_limits(float *target, float *current_position, work_envelope_t *envelope)
 {
+    // If keepout is not active, pass through to the original handler.
     if (!is_keepout_active()) {
         if (prev_apply_travel_limits)
             prev_apply_travel_limits(target, current_position, envelope);
         return;
     }
 
-    float xt = target[X_AXIS];
-    float yt = target[Y_AXIS];
     float x0 = current_position[X_AXIS];
     float y0 = current_position[Y_AXIS];
+    float xt = target[X_AXIS];
+    float yt = target[Y_AXIS];
 
+    // Check if the machine is currently inside the actual keepout zone.
+    if (inside_keepout_zone) {
+        report_message("ATCI: You are currently inside the keepout zone. Disable keepout before Jogging to safety", Message_Warning);
+        memcpy(target, current_position, sizeof(float) * N_AXIS); // Block move
+        return;
+    }
+
+    // Check if the intended move will enter or cross the keepout zone.
     bool in_box = (xt >= keepout_xmin() && xt <= keepout_xmax() && yt >= keepout_ymin() && yt <= keepout_ymax());
     bool intersects = line_intersects_keepout(x0, y0, xt, yt);
 
     if (in_box || intersects) {
-        if (inside_keepout_zone)
-            report_message("ATCI: You are currently inside the keepout zone. Disable keepout before Jogging to safety", Message_Warning);
-        else
-            report_message("ATCI: Jog move blocked", Message_Warning);
-        memcpy(target, current_position, sizeof(float) * N_AXIS);
+        float clipped_target[N_AXIS];
+        if (calculate_clipped_point(current_position, target, clipped_target)) {
+            // SUCCESS: We are starting away from the boundary and a valid clip was found.
+            report_message("ATCI: Jog move clipped at keepout boundary.", Message_Warning);
+            memcpy(target, clipped_target, sizeof(float) * N_AXIS); // Apply our calculated clip
+        } else {
+            // FAILURE: Clipping function returned false. This almost always means we are already
+            // at the safety boundary and trying to move further in. Block the move
+            report_message("ATCI: Jog move blocked at keepout boundary.", Message_Warning);
+            memcpy(target, current_position, sizeof(float) * N_AXIS);
+        }
+        // We have handled the move (either by clipping or blocking), so we must return and
+        // NOT call the previous handler.
         return;
     }
 
+    // If the move is safe, let the original handler process it.
     if (prev_apply_travel_limits)
         prev_apply_travel_limits(target, current_position, envelope);
 }
