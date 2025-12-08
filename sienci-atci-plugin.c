@@ -83,8 +83,6 @@ static apply_travel_limits_ptr prev_apply_travel_limits = NULL;
 #define SETTING_X_MAX                 686
 #define SETTING_Y_MAX                 687
 
-#define KEEPOUT_SAFETY_MARGIN 1.0f
-
 /* --- Helpers --- */
 
 /* Build runtime cached min/max and mirror flags from persistent config */
@@ -187,7 +185,7 @@ static bool line_intersects_keepout(float x0, float y0, float x1, float y1)
             }
         }
     }
-    return true;
+    return t0 < t1;
 }
 
 /* --- Travel & jog protection --- */
@@ -213,7 +211,7 @@ static bool travel_limits_check(float *target, axes_signals_t axes, bool is_cart
     }
 
     if (line_intersects_keepout(x0, y0, xt, yt)) {
-        if (inside_keepout_zone)
+        if (currently_inside)
             report_message("ATCI: You are currently inside the keepout zone", Message_Warning);
         else
             report_message("ATCI: Move crosses keepout zone", Message_Warning);
@@ -231,10 +229,10 @@ static bool calculate_clipped_point(const float *start, const float *end, float 
     const float x1 = end[X_AXIS];
     const float y1 = end[Y_AXIS];
 
-    const float safe_boundary_xmin = atci.x_min - KEEPOUT_SAFETY_MARGIN;
-    const float safe_boundary_xmax = atci.x_max + KEEPOUT_SAFETY_MARGIN;
-    const float safe_boundary_ymin = atci.y_min - KEEPOUT_SAFETY_MARGIN;
-    const float safe_boundary_ymax = atci.y_max + KEEPOUT_SAFETY_MARGIN;
+    const float safe_boundary_xmin = atci.x_min;
+    const float safe_boundary_xmax = atci.x_max;
+    const float safe_boundary_ymin = atci.y_min;
+    const float safe_boundary_ymax = atci.y_max;
 
     float t0 = 0.0f, t1 = 1.0f;
     const float dx = x1 - x0;
