@@ -185,6 +185,7 @@ static bool line_intersects_keepout(float x0, float y0, float x1, float y1)
             }
         }
     }
+    /* CHANGED: Strict inequality allows touching (t0==t1) without flagging as intersection */
     return t0 < t1;
 }
 
@@ -200,10 +201,12 @@ static bool travel_limits_check(float *target, axes_signals_t axes, bool is_cart
     float x0 = pos ? pos[X_AXIS] : 0.0f;
     float y0 = pos ? pos[Y_AXIS] : 0.0f;
 
-    bool currently_inside = (x0 > atci.x_min && x0 < atci.x_max && y0 > atci.y_min && y0 < atci.y_max);
+    /* CHANGED: Use Strict Inequality (> <).
+       (10, 20) is NOT strictly inside, so we don't auto-block. */
+    bool strictly_inside = (x0 > atci.x_min && x0 < atci.x_max && y0 > atci.y_min && y0 < atci.y_max);
 
     if (xt >= atci.x_min && xt <= atci.x_max && yt >= atci.y_min && yt <= atci.y_max) {
-        if (currently_inside)
+        if (strictly_inside)
             report_message("ATCI: You are currently inside the keepout zone", Message_Warning);
         else
             report_message("ATCI: Target inside region", Message_Warning);
@@ -211,7 +214,7 @@ static bool travel_limits_check(float *target, axes_signals_t axes, bool is_cart
     }
 
     if (line_intersects_keepout(x0, y0, xt, yt)) {
-        if (currently_inside)
+        if (strictly_inside)
             report_message("ATCI: You are currently inside the keepout zone", Message_Warning);
         else
             report_message("ATCI: Move crosses keepout zone", Message_Warning);
@@ -284,15 +287,20 @@ static void keepout_apply_travel_limits(float *target, float *current_position, 
     float xt = target[X_AXIS];
     float yt = target[Y_AXIS];
 
-    bool currently_inside = (x0 > atci.x_min && x0 < atci.x_max && y0 > atci.y_min && y0 < atci.y_max);
+    /* CHANGED: Strict Inequality. */
+    bool strictly_inside = (x0 > atci.x_min && x0 < atci.x_max && y0 > atci.y_min && y0 < atci.y_max);
 
-
-    if (currently_inside) {
+    /* Only block if we are DEEP inside. If on boundary, allow through to intersection check. */
+    if (strictly_inside) {
         report_message("ATCI: You are currently inside the keepout zone. Disable keepout before Jogging to safety", Message_Warning);
         memcpy(target, current_position, sizeof(float) * N_AXIS); /* Block move */
         return;
     }
 
+    /* Standard clipping logic proceeds here...
+       If on boundary and moving OUT: line_intersects_keepout returns false -> Allowed.
+       If on boundary and moving IN: line_intersects_keepout returns true -> Clipped.
+    */
     bool in_box = (xt >= atci.x_min && xt <= atci.x_max && yt >= atci.y_min && yt <= atci.y_max);
     bool intersects = line_intersects_keepout(x0, y0, xt, yt);
 
