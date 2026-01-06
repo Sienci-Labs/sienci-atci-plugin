@@ -493,7 +493,7 @@ static void onReportOptions(bool newopt)
     if (on_report_options)
         on_report_options(newopt);
     if (!newopt)
-        report_plugin("SIENCI ATCi plugin", "0.3.3");
+        report_plugin("SIENCI ATCi plugin", "0.4.0");
 }
 
 static void onReportNgcParameters(void)
