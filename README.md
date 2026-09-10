@@ -2,6 +2,8 @@
 
 This plugin provides advanced safety, state management, and sensor integration for the **[Sienci Automatic Tool Changer (ATC)](https://sienci.com/product/automatic_tool_changer/)**.
 
+The plugin is supported on Longboard32, Longboard32_EXT, and SLB-Lite boards.
+
 Its primary function is to enforce a **Keepout Zone** around the tool rack. This prevents the machine from accidentally jogging or moving into the tool rack during normal operation, while automatically allowing access during tool change macros.
 
 ## Features
@@ -16,6 +18,8 @@ Its primary function is to enforce a **Keepout Zone** around the tool rack. This
     *   Drawbar Status (Open/Closed)
     *   Tool Presence (Is a tool in the spindle?)
     *   Air Pressure
+*   **SLB-Lite spindle safety:** Monitors the ATC temperature sensor and raises
+    an E-stop if a sensor that was present at startup later disconnects.
 
 ## Configuration
 
@@ -31,7 +35,7 @@ The plugin adds the following settings to grblHAL. You must configure the bounda
 
 ### Setting $683 Flags
 *   **Enable:** Master switch for the plugin.
-*   **Monitor Rack Presence:** If enabled, the Keepout Zone is only active if the Rack Sensor (Aux Input 7) detects the rack is installed.
+*   **Monitor Rack Presence:** If enabled, the Keepout Zone is only active if the Rack Sensor detects the rack is installed. On Longboard boards this is Aux Input 7; on SLB-Lite it is MCP23017 input port 0.
 *   **Monitor TC Macro:** If enabled, the plugin automatically disables the Keepout Zone when it detects a Tool Change macro running.
 
 ## Usage
@@ -65,3 +69,25 @@ The plugin appends a status string to the grblHAL realtime report (e.g., `|ATCI:
 | **Drawbar** | `AUXINPUT0` | Detects drawbar position. |
 | **Tool Sensor** | `AUXINPUT1` | Detects if a tool is in the collet. |
 | **Pressure** | `AUXINPUT2` | Monitors air pressure. |
+
+### SLB-Lite MCP23017 Mapping
+
+On SLB-Lite, the ATC sensors use MCP23017 input ports without claiming the
+ports:
+
+| MCP Input | Description |
+| :--- | :--- |
+| 0 | Sienci ATC Rack |
+| 1 | Sienci ATC Drawbar Sensor |
+| 2 | Sienci ATC Tool Sensor |
+| 3 | Sienci ATC Temperature Sensor |
+| 4 | Sienci ATC Pressure Sensor |
+
+MCP23017 output ports 0 through 2 are named `Sienci ATC Drawbar Enable`,
+`Sienci ATC Drawbar`, and `Sienci ATC Airseal`. The plugin does not claim these
+ports.
+
+The temperature sensor is sampled at startup. If it is low at startup, the
+plugin assumes no spindle is present and does not arm the safety check. If it
+starts high and later goes low, the plugin raises an E-stop and reports
+`Spindle Overheated or Temp Sensor disconnected`.
