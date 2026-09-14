@@ -82,57 +82,85 @@ static on_tool_selected_ptr prev_on_tool_selected = NULL;
 static on_tool_changed_ptr prev_on_tool_changed = NULL;
 static bool tc_macro_running = false;
 
+#if defined(BOARD_SLB_LITE)
 typedef struct {
-    uint8_t id;
-    bool state;
-} mcp_input_read_t;
+    pin_function_t function;
+    bool found;
+} mcp_pin_t;
 
-static bool read_mcp_input (xbar_t *pin, uint8_t port, void *data)
+typedef struct {
+    mcp_pin_t inputs[5];
+    mcp_pin_t outputs[3];
+} mcp_atci_ports_t;
+
+static mcp_atci_ports_t mcp_atci_ports = {};
+
+static void capture_mcp_atci_pin (xbar_t *pin, void *data)
 {
-    static const char *const descriptions[] = {
-        "Sienci ATC Rack",
-        "Sienci ATC Drawbar Sensor",
-        "Sienci ATC Tool Sensor",
-        "Sienci ATC Temperature Sensor",
-        "Sienci ATC Pressure Sensor"
-    };
+    mcp_atci_ports_t *ports = data;
+    const char *source = pin->port;
 
-    UNUSED(port);
+    if(source && strncmp(source, "MCP23017:", 9) == 0) {
+        if(pin->group == PinGroup_AuxInput && pin->pin < sizeof(ports->inputs) / sizeof(ports->inputs[0])) {
+            ports->inputs[pin->pin].function = pin->function;
+            ports->inputs[pin->pin].found = true;
+        } else if(pin->group == PinGroup_AuxOutput && pin->pin < sizeof(ports->outputs) / sizeof(ports->outputs[0])) {
+            ports->outputs[pin->pin].function = pin->function;
+            ports->outputs[pin->pin].found = true;
+        }
+    }
+}
 
-    mcp_input_read_t *read = data;
+typedef struct {
+    const mcp_pin_t *pins;
+    const char *const *descriptions;
+    uint8_t count;
+    bool state;
+} mcp_port_action_t;
 
-    // MCP input ports are exposed as board-dependent Aux function numbers.
-    // The expander-local xbar id remains stable, so use that instead.
-    if(pin->group == PinGroup_AuxInput && pin->id < sizeof(descriptions) / sizeof(char *) && pin->cap.external) {
-        // Match eventout: label existing ports, but do not claim ownership.
-        ioport_set_description(Port_Digital, Port_Input, port, descriptions[pin->id]);
+static bool apply_mcp_atci_port (xbar_t *pin, uint8_t port, void *data)
+{
+    mcp_port_action_t *action = data;
 
-        if(pin->id == read->id && pin->get_value)
-            read->state = pin->get_value(pin) != 0.0f;
+    for(uint8_t bit = 0; bit < action->count; bit++) {
+        if(action->pins[bit].found && pin->function == action->pins[bit].function) {
+            if(action->descriptions)
+                ioport_set_description(Port_Digital, pin->group == PinGroup_AuxInput ? Port_Input : Port_Output, port, action->descriptions[bit]);
+            else if(pin->get_value)
+                action->state = pin->get_value(pin) != 0.0f;
+
+            return true;
+        }
     }
 
     return false;
 }
 
+static bool mcp_input_state (uint8_t bit)
+{
+    mcp_port_action_t action = {
+        .pins = mcp_atci_ports.inputs,
+        .count = sizeof(mcp_atci_ports.inputs) / sizeof(mcp_atci_ports.inputs[0])
+    };
+
+    if(bit < action.count && action.pins[bit].found) {
+        action.pins += bit;
+        action.count = 1;
+        ioports_enumerate(Port_Digital, Port_Input, (pin_cap_t){ .external = On }, apply_mcp_atci_port, &action);
+    }
+
+    return action.state;
+}
+#endif
+
 static bool rack_present (void)
 {
 #if defined(BOARD_SLB_LITE)
-    mcp_input_read_t read = { .id = 0 };
-    ioports_enumerate(Port_Digital, Port_Input, (pin_cap_t){ .external = On }, read_mcp_input, &read);
-    return read.state;
+    return mcp_input_state(0);
 #else
     return !DIGITAL_IN(AUXINPUT7_PORT, AUXINPUT7_PIN);
 #endif
 }
-
-#if defined(BOARD_SLB_LITE)
-static bool mcp_input_state (uint8_t id)
-{
-    mcp_input_read_t read = { .id = id };
-    ioports_enumerate(Port_Digital, Port_Input, (pin_cap_t){ .external = On }, read_mcp_input, &read);
-    return read.state;
-}
-#endif
 
 #if defined(BOARD_SLB_LITE)
 #define NATIVE_INPUT_LOW(pin) (!gpio_get(pin))
@@ -141,25 +169,36 @@ static bool mcp_input_state (uint8_t id)
 #endif
 
 #if defined(BOARD_SLB_LITE)
-static bool label_mcp_atc_outputs (xbar_t *pin, uint8_t port, void *data)
+static void label_mcp_atc_ports (void)
 {
-    static const char *const descriptions[] = {
+    static const char *const inputs[] = {
+        "Sienci ATC Rack",
+        "Sienci ATC Drawbar Sensor",
+        "Sienci ATC Tool Sensor",
+        "Sienci ATC Temperature Sensor",
+        "Sienci ATC Pressure Sensor"
+    };
+    static const char *const outputs[] = {
         "Sienci ATC Drawbar Enable",
         "Sienci ATC Drawbar",
         "Sienci ATC Airseal"
     };
 
-    UNUSED(data);
+    mcp_port_action_t inputs_action = {
+        .pins = mcp_atci_ports.inputs,
+        .descriptions = inputs,
+        .count = sizeof(inputs) / sizeof(inputs[0])
+    };
+    mcp_port_action_t outputs_action = {
+        .pins = mcp_atci_ports.outputs,
+        .descriptions = outputs,
+        .count = sizeof(outputs) / sizeof(outputs[0])
+    };
 
-    if(pin->group == PinGroup_AuxOutput && pin->id < sizeof(descriptions) / sizeof(char *) && pin->cap.external)
-        ioport_set_description(Port_Digital, Port_Output, port, descriptions[pin->id]);
-
-    return false;
-}
-
-static void label_mcp_atc_ports (void)
-{
-    ioports_enumerate(Port_Digital, Port_Output, (pin_cap_t){ .external = On }, label_mcp_atc_outputs, NULL);
+    memset(&mcp_atci_ports, 0, sizeof(mcp_atci_ports));
+    hal.enumerate_pins(false, capture_mcp_atci_pin, &mcp_atci_ports);
+    ioports_enumerate(Port_Digital, Port_Input, (pin_cap_t){ .external = On }, apply_mcp_atci_port, &inputs_action);
+    ioports_enumerate(Port_Digital, Port_Output, (pin_cap_t){ .external = On }, apply_mcp_atci_port, &outputs_action);
 }
 #endif
 
