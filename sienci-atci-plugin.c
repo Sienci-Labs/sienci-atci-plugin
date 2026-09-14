@@ -17,6 +17,12 @@
 #include "grbl/task.h"
 #include "grbl/ioports.h"
 
+#if defined(BOARD_SLB_LITE) && MCP23017_ENABLE
+#define ATCI_SLB_MCP 1
+#else
+#define ATCI_SLB_MCP 0
+#endif
+
 /*
    TOLERANCE BUFFER
    We only flag the tool as "Trapped" (blocking ALL movement) if it is deeper
@@ -82,7 +88,7 @@ static on_tool_selected_ptr prev_on_tool_selected = NULL;
 static on_tool_changed_ptr prev_on_tool_changed = NULL;
 static bool tc_macro_running = false;
 
-#if defined(BOARD_SLB_LITE)
+#if ATCI_SLB_MCP
 typedef struct {
     pin_function_t function;
     bool found;
@@ -94,6 +100,23 @@ typedef struct {
 } mcp_atci_ports_t;
 
 static mcp_atci_ports_t mcp_atci_ports = {};
+static enumerate_pins_ptr on_enumerate_pins = NULL;
+static void enumerate_mcp_atci_pins (bool low_level, pin_info_ptr callback, void *data);
+
+static const char *const mcp_atci_input_descriptions[] = {
+    "Sienci ATC Rack",
+    "Sienci ATC Drawbar Sensor",
+    "Sienci ATC Tool Sensor",
+    "Sienci ATC Temperature Sensor",
+    "Sienci ATC Pressure Sensor"
+};
+static const char *const mcp_atci_output_descriptions[] = {
+    "Sienci ATC Drawbar Enable",
+    "Sienci ATC Drawbar",
+    "Sienci ATC Airseal"
+};
+static char mcp_atci_input_labels[sizeof(mcp_atci_input_descriptions) / sizeof(mcp_atci_input_descriptions[0])][64];
+static char mcp_atci_output_labels[sizeof(mcp_atci_output_descriptions) / sizeof(mcp_atci_output_descriptions[0])][64];
 
 static void capture_mcp_atci_pin (xbar_t *pin, void *data)
 {
@@ -113,7 +136,6 @@ static void capture_mcp_atci_pin (xbar_t *pin, void *data)
 
 typedef struct {
     const mcp_pin_t *pins;
-    const char *const *descriptions;
     uint8_t count;
     bool state;
 } mcp_port_action_t;
@@ -124,9 +146,7 @@ static bool apply_mcp_atci_port (xbar_t *pin, uint8_t port, void *data)
 
     for(uint8_t bit = 0; bit < action->count; bit++) {
         if(action->pins[bit].found && pin->function == action->pins[bit].function) {
-            if(action->descriptions)
-                ioport_set_description(Port_Digital, pin->group == PinGroup_AuxInput ? Port_Input : Port_Output, port, action->descriptions[bit]);
-            else if(pin->get_value)
+            if(pin->get_value)
                 action->state = pin->get_value(pin) != 0.0f;
 
             return true;
@@ -155,50 +175,65 @@ static bool mcp_input_state (uint8_t bit)
 
 static bool rack_present (void)
 {
-#if defined(BOARD_SLB_LITE)
+#if ATCI_SLB_MCP
     return mcp_input_state(0);
+#elif defined(BOARD_SLB_LITE)
+    return false;
 #else
     return !DIGITAL_IN(AUXINPUT7_PORT, AUXINPUT7_PIN);
 #endif
 }
 
-#if defined(BOARD_SLB_LITE)
-#define NATIVE_INPUT_LOW(pin) (!gpio_get(pin))
-#else
+#if !defined(BOARD_SLB_LITE)
 #define NATIVE_INPUT_LOW(port, pin) (!DIGITAL_IN(port, pin))
 #endif
 
-#if defined(BOARD_SLB_LITE)
+#if ATCI_SLB_MCP
 static void label_mcp_atc_ports (void)
 {
-    static const char *const inputs[] = {
-        "Sienci ATC Rack",
-        "Sienci ATC Drawbar Sensor",
-        "Sienci ATC Tool Sensor",
-        "Sienci ATC Temperature Sensor",
-        "Sienci ATC Pressure Sensor"
-    };
-    static const char *const outputs[] = {
-        "Sienci ATC Drawbar Enable",
-        "Sienci ATC Drawbar",
-        "Sienci ATC Airseal"
-    };
-
-    mcp_port_action_t inputs_action = {
-        .pins = mcp_atci_ports.inputs,
-        .descriptions = inputs,
-        .count = sizeof(inputs) / sizeof(inputs[0])
-    };
-    mcp_port_action_t outputs_action = {
-        .pins = mcp_atci_ports.outputs,
-        .descriptions = outputs,
-        .count = sizeof(outputs) / sizeof(outputs[0])
-    };
-
     memset(&mcp_atci_ports, 0, sizeof(mcp_atci_ports));
     hal.enumerate_pins(false, capture_mcp_atci_pin, &mcp_atci_ports);
-    ioports_enumerate(Port_Digital, Port_Input, (pin_cap_t){ .external = On }, apply_mcp_atci_port, &inputs_action);
-    ioports_enumerate(Port_Digital, Port_Output, (pin_cap_t){ .external = On }, apply_mcp_atci_port, &outputs_action);
+
+    if(on_enumerate_pins == NULL) {
+        on_enumerate_pins = hal.enumerate_pins;
+        hal.enumerate_pins = enumerate_mcp_atci_pins;
+    }
+}
+
+typedef struct {
+    pin_info_ptr callback;
+    void *data;
+    bool low_level;
+} pin_report_t;
+
+static void report_mcp_atci_pin (xbar_t *pin, void *data)
+{
+    pin_report_t *report = data;
+    const char *source = pin->port;
+    const char *port_label = pin->description ? pin->description : "";
+
+    if(!report->low_level && source && strncmp(source, "MCP23017:", 9) == 0) {
+        if(pin->group == PinGroup_AuxInput && pin->pin < sizeof(mcp_atci_input_descriptions) / sizeof(mcp_atci_input_descriptions[0])) {
+            snprintf(mcp_atci_input_labels[pin->pin], sizeof(mcp_atci_input_labels[pin->pin]), "%s: %s", port_label, mcp_atci_input_descriptions[pin->pin]);
+            pin->description = mcp_atci_input_labels[pin->pin];
+        } else if(pin->group == PinGroup_AuxOutput && pin->pin < sizeof(mcp_atci_output_descriptions) / sizeof(mcp_atci_output_descriptions[0])) {
+            snprintf(mcp_atci_output_labels[pin->pin], sizeof(mcp_atci_output_labels[pin->pin]), "%s: %s", port_label, mcp_atci_output_descriptions[pin->pin]);
+            pin->description = mcp_atci_output_labels[pin->pin];
+        }
+    }
+
+    report->callback(pin, report->data);
+}
+
+static void enumerate_mcp_atci_pins (bool low_level, pin_info_ptr callback, void *data)
+{
+    pin_report_t report = {
+        .callback = callback,
+        .data = data,
+        .low_level = low_level
+    };
+
+    on_enumerate_pins(low_level, report_mcp_atci_pin, &report);
 }
 #endif
 
@@ -211,7 +246,7 @@ static bool drawbar_state = false;
 static bool tool_sensor_state = false;
 static bool pressure_sensor_state = false;
 static bool inside_keepout_zone = false;
-#if defined(BOARD_SLB_LITE)
+#if ATCI_SLB_MCP
 static bool temperature_sensor_armed = false;
 static bool temperature_sensor_estopped = false;
 static void temperature_sensor_estop (void *data)
@@ -300,7 +335,7 @@ static void poll_rack_sensor (void *data)
     }
 
     /* Additional sensors (optional) */
-#if defined(BOARD_SLB_LITE)
+#if ATCI_SLB_MCP
     drawbar_state         = mcp_input_state(1);
     tool_sensor_state     = mcp_input_state(2);
     pressure_sensor_state = mcp_input_state(4);
@@ -312,6 +347,8 @@ static void poll_rack_sensor (void *data)
         // Keep the ISR-oriented control callback out of the sensor polling body.
         task_add_immediate(temperature_sensor_estop, NULL);
     }
+#elif defined(BOARD_SLB_LITE)
+    drawbar_state = tool_sensor_state = pressure_sensor_state = false;
 #else
     drawbar_state         = NATIVE_INPUT_LOW(AUXINPUT0_PORT, AUXINPUT0_PIN);
     tool_sensor_state     = NATIVE_INPUT_LOW(AUXINPUT1_PORT, AUXINPUT1_PIN);
@@ -744,7 +781,7 @@ void atci_init(void)
 
     if ((nvs_addr = nvs_alloc(sizeof(config)))) {
         settings_register(&settings);
-#if defined(BOARD_SLB_LITE)
+#if ATCI_SLB_MCP
         label_mcp_atc_ports();
         temperature_sensor_armed = mcp_input_state(3);
 #endif
