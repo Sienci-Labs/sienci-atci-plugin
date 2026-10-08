@@ -176,7 +176,8 @@ static bool mcp_input_state (uint8_t bit)
 static bool rack_present (void)
 {
 #if ATCI_SLB_MCP
-    return mcp_input_state(0);
+    // SLB-Lite rack presence is active-low; an absent port is not a rack.
+    return mcp_atci_ports.inputs[0].found && !mcp_input_state(0);
 #elif defined(BOARD_SLB_LITE)
     return false;
 #else
